@@ -177,3 +177,12 @@ just start with images
 ```
 poetry run python openhands/docs/ramp.py
 ```
+
+## Test code
+```
+pytest
+```
+or
+```
+pytest tests/unit/test_session.py
+```

@@ -38,60 +38,18 @@ from openhands.server.session.agent_session import AgentSession
 from openhands.server.session.conversation_init_data import ConversationInitData
 from openhands.storage.data_models.settings import Settings
 from openhands.storage.files import FileStore
+from openhands.server.session.schemas import (
+    AgentSettings,
+    LLMConfig,
+    SandboxConfig,
+    SecurityConfig,
+    SessionParameters,
+    CondenserPipelineConfig
+)
+
+from openhands.core.config.agent_config import AgentConfig
 
 ROOM_KEY = 'room:{sid}'
-
-
-from dataclasses import dataclass, field
-from typing import List, Dict
-
-@dataclass
-class LLMConfig:
-    model: str = ''
-    api_key: str | None = None
-    base_url: str | None = None
-    # ... 기타 LLM 관련 설정
-
-@dataclass
-class SecurityConfig:
-    confirmation_mode: str = 'auto'
-    security_analyzer: str | None = None
-
-@dataclass
-class SandboxConfig:
-    base_container_image: str | None = None
-    runtime_container_image: str | None = None
-
-@dataclass
-class AgentSettings:
-    """최종적으로 에이전트 실행에 필요한 모든 설정을 담는 컨테이너"""
-    agent_cls: type
-    max_iterations: int
-    max_budget_per_task: float | None
-    llm_config: LLMConfig
-    security_config: SecurityConfig
-    sandbox_config: SandboxConfig
-    mcp_config: MCPConfig # MCPConfig도 dataclass로 정의되었다고 가정
-    condenser_config: CondenserPipelineConfig | None = None
-    # ... 기타 필요한 설정 그룹
-
-@dataclass
-class SessionParameters:
-    """
-    세션 시작에 필요한 파라미터를 담는 데이터 클래스입니다.
-    필요한 필드를 상황에 맞게 추가/수정하세요.
-    """
-    initial_message: str | None = None
-    replay_json: str | None = None
-    git_provider_tokens: object = None  # 타입을 구체적으로 지정할 수 있으면 수정하세요
-    # 필요에 따라 추가 필드 선언
-    # 예시:
-    # selected_repository: str | None = None
-    # selected_branch: str | None = None
-    # custom_secrets: dict | None = None
-    custom_secrets: CUSTOM_SECRETS_TYPE | None = None
-    # conversation_instructions: str | None = None
-    # 기타 필요한 파라미터들...
 
 
 
@@ -194,13 +152,39 @@ def build_agent_settings(base_config, user_settings: Settings) -> AgentSettings:
         condenser_config=condenser_conf,
     )
 
+# 새 FP 함수 (Part 2: Data Transformation Logic)
+def get_llm_config_from_agent(config: OpenHandsConfig, agent_name: str) -> LLMConfig:
+    """주어진 config에서 agent_name에 맞는 LLMConfig를 반환합니다."""
+    # 원본 self.config.get_llm_config_from_agent() 로직 재사용/적응
+    # (실제 구현은 config의 내부 메서드를 호출하거나 로직 복사)
+    return config.get_llm_config_from_agent(agent_name)  # config를 파라미터로 받아 self 제거
+
+# 업데이트된 Composition 함수 (Part 3: Object Assembly Logic)
+def compose_llm(config: OpenHandsConfig, agent_cls: str | None, llm_config: LLMConfig) -> LLM:
+    agent_name = agent_cls if agent_cls is not None else 'agent'
+    llm_specific_config = get_llm_config_from_agent(config, agent_name)  # 새 함수 호출
+    return LLM(
+        config=llm_specific_config,
+        retry_listener=_notify_on_llm_retry,  # 별도 함수로 추출 (기존 self._notify_on_llm_retry 대신)
+    )
+
+def _notify_on_llm_retry(self, retries: int, max: int) -> None:
+        msg_id = 'STATUS$LLM_RETRY'
+        self.queue_status_message(
+            'info', msg_id, f'Retrying LLM request, {retries} / {max}'
+        )
+
+# need to add AgentConfig
+def compose_agent(agent_cls: type, llm:LLM, agent_config: AgentConfig):
+    return Agent.get_cls(agent_cls)(llm, agent_config)
+
+
 
 class Session:
     sid: str
     sio: socketio.AsyncServer | None
     last_active_ts: int = 0
     is_alive: bool = True
-    agent_session: AgentSession
     loop: asyncio.AbstractEventLoop
     config: OpenHandsConfig
     file_store: FileStore
@@ -212,6 +196,7 @@ class Session:
         sid: str,
         config: OpenHandsConfig,
         file_store: FileStore,
+        agent_session: AgentSession,
         sio: socketio.AsyncServer | None,
         user_id: str | None = None,
     ):
@@ -220,18 +205,7 @@ class Session:
         self.last_active_ts = int(time.time())
         self.file_store = file_store
         self.logger = OpenHandsLoggerAdapter(extra={'session_id': sid})
-        # self.agent_session = AgentSession(
-        #     sid,
-        #     file_store,
-        #     status_callback=self.queue_status_message,
-        #     user_id=user_id,
-        # )
         self.agent_session = agent_session
-        self.agent_session.event_stream.subscribe(
-            EventStreamSubscriber.SERVER, self.on_event, self.sid
-        )
-
-        # Copying this means that when we update variables they are not applied to the shared global configuration!
         self.config = deepcopy(config)
         self.loop = asyncio.get_event_loop()
         self.user_id = user_id
@@ -400,7 +374,13 @@ class Session:
         #     )
         #     return
 
+        #WORKING
         try:
+            self.agent_session.event_stream.add_event(
+                AgentStateChangedObservation('', AgentState.LOADING),
+                EventSource.ENVIRONMENT,
+            )
+
             # 1. 순수 함수를 호출해 모든 설정을 한번에 생성 (데이터 변환)
             agent_settings = build_agent_settings(self.config, settings)
 
@@ -415,16 +395,18 @@ class Session:
 
             # 3. 완성된 설정(데이터)을 바탕으로 실제 행위를 하는 '객체'들을 생성 (컴포지션)
             # 이 부분부터는 다시 OOP의 세계와 자연스럽게 연결됩니다.
-            llm = self._create_llm(agent_settings.agent_cls, agent_settings.llm_config)
+            llm = compose_llm(self.config, agent_settings.agent_cls, agent_settings.llm_config)
+
             agent_config = self.config.get_agent_config(agent_settings.agent_cls)
             agent_config.condenser = agent_settings.condenser_config
-            agent = Agent.get_cls(agent_settings.agent_cls)(llm, agent_config)
+            agent = compose_agent(agent_settings.agent_cls, llm, agent_config)
 
             # 3. 세션 시작에 필요한 파라미터를 담는 컨테이너 객체 생성
             session_params = self._prepare_session_parameters(settings, initial_message, replay_json)
 
             # 4. 단순화된 파라미터로 세션 시작
             await self.agent_session.start(
+                config=self.config,
                 agent=agent,
                 settings=agent_settings,
                 params=session_params
@@ -484,6 +466,10 @@ class Session:
             event,
             (CmdOutputObservation, AgentStateChangedObservation, RecallObservation),
         ):
+            print('---environments----')
+            print(event)
+            print(event_to_dict(event))
+            print('-'*50)
             # feedback from the environment to agent actions is understood as agent events by the UI
             event_dict = event_to_dict(event)
             event_dict['source'] = EventSource.AGENT

@@ -42,6 +42,12 @@ class SessionConfig:
     user_id: str | None
     file_store: FileStore
 
+@dataclass
+class Result:
+    success: bool
+    error: Exception | None = None
+    value: Session | None = None
+
 
 def build_session_config(sid: str, user_id: str | None, file_store: FileStore) -> SessionConfig:
     return SessionConfig(sid=sid, user_id=user_id, file_store=file_store)
@@ -70,7 +76,9 @@ def compose_session(config: SessionConfig, sio: socketio.AsyncServer | None) -> 
 def initialize_session(session: Session, status_callback: Callable) -> Session:
     """[FP-Style] 동적 의존성(콜백) 설정."""
     session.agent_session.status_callback = status_callback
-    session.agent_session.event_stream.subscribe(...)  # 구독 설정
+    session.agent_session.event_stream.subscribe(
+        EventStreamSubscriber.SERVER, session.on_event, session.sid
+    )  # 구독 설정
     return session
 
 
@@ -300,6 +308,7 @@ class StandaloneConversationManager(ConversationManager):
             )
         return self._agent_loop_info_from_session(session)
 
+    #WORKING
     async def _start_agent_loop(
         self,
         sid: str,
@@ -342,39 +351,6 @@ class StandaloneConversationManager(ConversationManager):
                 await self.close_session(oldest_conversation_id)
 
 
-        # FIXME: pass object not argument
-        # build @dataclass
-
-        # build FP for composition of agent_session
-        # return AgentSession(runtime=runtime)
-
-        # build agnet_session class
-        # class AgentSession:
-        #     """[OOP-Style] AgentSession은 runtime이라는 '상태'를 가집니다."""
-        #     def __init__(self, runtime):
-        #         self._runtime = runtime         # 상태 (State)
-        #         self._is_running = False        # 상태 (State)
-
-        #     def start(self, agent: Agent):
-        #         """[OOP-Style] 자신의 상태를 기반으로 행위를 수행합니다."""
-        #         print("AgentSession: 세션 시작...")
-        #         if not self._is_running:
-        #             self._runtime.connect()
-        #             agent.think()
-        #             self._is_running = True
-
-        # call the composition but what about compose() in  agent_session.py
-        # agent_session = composition.compose_agent_session()
-
-        # and then pass it as parameter
-        # session = Session(
-        #     sid=sid,
-        #     file_store=self.file_store,
-        #     config=self.config,
-        #     sio=self.sio,
-        #     user_id=user_id,
-        #     # agent_session=agent_session
-        # )
         config = build_session_config(sid, user_id, self.file_store)
         session = compose_session(config, self.sio)
         session = initialize_session(session, session.queue_status_message)
@@ -382,17 +358,8 @@ class StandaloneConversationManager(ConversationManager):
 
         self._local_agent_loops_by_sid[sid] = session
         asyncio.create_task(
-            # session.initialize_agent(settings, initial_user_msg, replay_json)
-
-            # result = try_initialize_agent(session, settings, initial_user_msg, replay_json),
-            try_initialize_agent(session, settings, initial_user_msg, replay_json),
-            print(result, 'check')
-            # if result.is_failure:
-            #     logger.error(result.error)
-            #     return
-            # try_initialize_agent(session, settings,initial_user_msg, replay_json)
+            try_initialize_agent(session, settings, initial_user_msg, replay_json)
         )
-        # This does not get added when resuming an existing conversation
         try:
             session.agent_session.event_stream.subscribe(
                 EventStreamSubscriber.SERVER,
@@ -610,7 +577,8 @@ def _last_updated_at_key(conversation: ConversationMetadata) -> float:
 # def try_initialize_agent(session: Session, settings: Settings) -> Result:  # Result는 커스텀 클래스 (success/value or failure/error)
 async def try_initialize_agent(session: Session, settings: Settings, initial_user_msg, replay_json) -> Result:  # Result는 커스텀 클래스 (success/value or failure/error)
     try:
-        await session.initialize_agent(settings, initial_user_msg, replay_jsonc)
+        await session.initialize_agent(settings, initial_user_msg, replay_json)
         return Result(success=True, value=session)
     except Exception as e:
+        logger.info(f'error invoked')
         return Result(success=False, error=e)
