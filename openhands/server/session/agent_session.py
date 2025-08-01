@@ -133,8 +133,23 @@ class ControllerParams:
 # Part 2: Data Transformation Logic (stateless 빌더 함수)
 def build_env_vars(custom_secrets: CUSTOM_SECRETS_TYPE | None) -> dict:
     """환경 변수 데이터를 변환합니다."""
-    handler = UserSecrets(custom_secrets or {})
+    handler = UserSecrets(custom_secrets=custom_secrets or {})  # keyword arg로 변경 (positional 피함)
     return handler.get_env_vars()
+
+
+def override_provider_tokens(
+    git_provider_tokens: PROVIDER_TOKEN_TYPE | None,
+    custom_secrets: CUSTOM_SECRETS_TYPE | None
+) -> PROVIDER_TOKEN_TYPE:
+    """[FP-Style] 토큰을 오버라이드하는 변환 로직."""
+    if git_provider_tokens and custom_secrets:
+        tokens = dict(git_provider_tokens)
+        for provider, _ in tokens.items():
+            token_name = ProviderHandler.get_provider_env_key(provider)
+            if token_name in custom_secrets or token_name.upper() in custom_secrets:
+                del tokens[provider]
+        return MappingProxyType(tokens)
+    return git_provider_tokens or cast(PROVIDER_TOKEN_TYPE, MappingProxyType({}))
 
 # Part 3: Object Assembly Logic (FP Composition 함수)
 def compose_security_analyzer(analyzer_name: str | None, event_stream: EventStream) -> SecurityAnalyzer | None:
@@ -143,41 +158,91 @@ def compose_security_analyzer(analyzer_name: str | None, event_stream: EventStre
         return options.SecurityAnalyzers.get(analyzer_name, SecurityAnalyzer)(event_stream)
     return None
 
-async def compose_runtime(params: RuntimeParams, session_params: SessionParameters) -> Runtime:
-    """[FP-Style] Runtime을 조립합니다."""
-    # 원본 _create_runtime 로직 재사용/적응
-    custom_secrets_handler = UserSecrets(session_params.custom_secrets or {})
-    env_vars = build_env_vars(session_params.custom_secrets)  # 빌더 호출
+# Part 3: Object Assembly Logic (compose_runtime 완성 - 파일 내용 기반)
+async def compose_runtime(
+    runtime_params: RuntimeParams,
+    session_params: SessionParameters,
+    event_stream: EventStream,  # 추가 DI: 필요한 의존성 주입
+    sid: str,
+    user_id: str | None,
+    status_callback: Callable | None
+) -> Runtime:
+    """
+    [FP-Style] Runtime 객체를 조립합니다.
+    빌더 함수 호출로 데이터 변환 후, 객체 생성/연결.
+    """
+    env_vars = build_env_vars(session_params.custom_secrets)
+    overrided_tokens = override_provider_tokens(
+        session_params.git_provider_tokens,
+        session_params.custom_secrets
+    )
 
-    runtime_cls = get_runtime_cls(params.runtime_name)
-    # ... (RemoteRuntime vs. 다른 경우 분기 로직 그대로)
-    runtime = runtime_cls(...)  # 세부 생성
-    await runtime.connect()
-    await runtime.clone_or_init_repo(...)  # 등등
+    # settings를 로드한 후
+    # if settings and settings.sandbox_runtime_container_image is None:
+    #     settings.sandbox_runtime_container_image = config.sandbox.runtime_container_image
+    runtime_cls = get_runtime_cls(runtime_params.runtime_name)
+    if runtime_cls == RemoteRuntime:
+        runtime = runtime_cls(
+            config=runtime_params.config,
+            event_stream=event_stream,
+            sid=sid,
+            plugins=runtime_params.agent.sandbox_plugins,
+            status_callback=status_callback,
+            headless_mode=False,
+            attach_to_existing=False,
+            git_provider_tokens=overrided_tokens,
+            env_vars=env_vars,
+            user_id=user_id,
+        )
+    else:
+        provider_handler = ProviderHandler(provider_tokens=overrided_tokens)
+        env_vars.update(await provider_handler.get_env_vars(expose_secrets=True))
+        runtime = runtime_cls(
+            config=runtime_params.config,
+            event_stream=event_stream,
+            sid=sid,
+            plugins=runtime_params.agent.sandbox_plugins,
+            status_callback=status_callback,
+            headless_mode=False,
+            attach_to_existing=False,
+            env_vars=env_vars,
+            git_provider_tokens=session_params.git_provider_tokens,
+        )
+
+    await asyncio.sleep(1)  # 기존 hack 유지
+    # await runtime.connect()
+    try:
+        await runtime.connect()
+    except AgentRuntimeUnavailableError as e:
+        self.logger.error(f'Runtime initialization failed: {e}')
+        if status_callback:
+            status_callback(
+                'error', 'STATUS$ERROR_RUNTIME_DISCONNECTED', str(e)
+            )
+        return False
+
+    exit(0)
+
+    # await runtime.clone_or_init_repo(
+    #     session_params.git_provider_tokens,
+    #     session_params.selected_repository,
+    #     session_params.selected_branch
+    # )
+    # await call_sync_from_async(runtime.maybe_run_setup_script)
+    # await call_sync_from_async(runtime.maybe_setup_git_hooks)
+
     return runtime
 
-async def compose_memory(params: MemoryParams) -> Memory:
-    """[FP-Style] Memory를 조립합니다."""
-    memory = Memory(
-        event_stream=params.event_stream,
-        sid=...,  # sid 등 필요한 값 전달
-        status_callback=...,
-    )
-    memory.set_runtime_info(params.runtime, params.custom_secrets_descriptions)
-    memory.set_conversation_instructions(params.conversation_instructions)
-    # ... (microagents 로딩 등 원본 로직)
-    return memory
-
-def compose_controller(params: ControllerParams, event_stream: EventStream, ...) -> AgentController:
-    """[FP-Style] AgentController를 조립합니다."""
-    # 원본 _create_controller 로직 재사용
-    initial_state = ...  # 상태 복원
-    controller = AgentController(
-        agent=params.agent,
-        confirmation_mode=params.confirmation_mode,
-        # ... 나머지 파라미터
-    )
-    return controller
+# def compose_controller(params: ControllerParams, event_stream: EventStream, ...) -> AgentController:
+#     """[FP-Style] AgentController를 조립합니다."""
+#     # 원본 _create_controller 로직 재사용
+#     initial_state = ...  # 상태 복원
+#     controller = AgentController(
+#         agent=params.agent,
+#         confirmation_mode=params.confirmation_mode,
+#         # ... 나머지 파라미터
+#     )
+#     return controller
 
 class AgentSession:
     """Represents a session with an Agent
@@ -282,9 +347,11 @@ class AgentSession:
             self.security_analyzer = compose_security_analyzer(config.security.security_analyzer, self.event_stream)
 
             runtimeParams = compose_runtime_params(config, agent)
-            exit(0)
+
+
             runtime_connected = await self._create_runtime(runtimeParams, params)
-            runtime_connected = await compose_runtime(runtime_params, params)
+            # runtime_connected = await compose_runtime(runtime_params, params)
+            exit(0)
 
             # runtime_connected = await self._create_runtime(
             #     runtime_name=runtime_name,
@@ -483,7 +550,8 @@ class AgentSession:
         # custom_secrets: CUSTOM_SECRETS_TYPE | None = None,
         # selected_repository: str | None = None,
         # selected_branch: str | None = None,
-        runtimeParams: RuntimeParams
+        runtimeParams: RuntimeParams,
+        sessionParams: SessionParameters
     ) -> bool:
         """Creates a runtime instance
 
@@ -499,74 +567,86 @@ class AgentSession:
         if self.runtime is not None:
             raise RuntimeError('Runtime already created')
 
-        custom_secrets_handler = UserSecrets(custom_secrets=custom_secrets or {})
-        env_vars = custom_secrets_handler.get_env_vars()
 
-        self.logger.debug(f'Initializing runtime `{runtime_name}` now...')
-        runtime_cls = get_runtime_cls(runtime_name)
-        if runtime_cls == RemoteRuntime:
-            # If provider tokens is passed in custom secrets, then remove provider from provider tokens
-            # We prioritize provider tokens set in custom secrets
-            overrided_tokens = self.override_provider_tokens_with_custom_secret(
-                git_provider_tokens, custom_secrets
-            )
-
-            self.runtime = runtime_cls(
-                config=config,
-                event_stream=self.event_stream,
-                sid=self.sid,
-                plugins=agent.sandbox_plugins,
-                status_callback=self._status_callback,
-                headless_mode=False,
-                attach_to_existing=False,
-                git_provider_tokens=overrided_tokens,
-                env_vars=env_vars,
-                user_id=self.user_id,
-            )
-        else:
-            provider_handler = ProviderHandler(
-                provider_tokens=git_provider_tokens
-                or cast(PROVIDER_TOKEN_TYPE, MappingProxyType({}))
-            )
-
-            # Merge git provider tokens with custom secrets before passing over to runtime
-            env_vars.update(await provider_handler.get_env_vars(expose_secrets=True))
-            self.runtime = runtime_cls(
-                config=config,
-                event_stream=self.event_stream,
-                sid=self.sid,
-                plugins=agent.sandbox_plugins,
-                status_callback=self._status_callback,
-                headless_mode=False,
-                attach_to_existing=False,
-                env_vars=env_vars,
-                git_provider_tokens=git_provider_tokens,
-            )
-
-        # FIXME: this sleep is a terrible hack.
-        # This is to give the websocket a second to connect, so that
-        # the status messages make it through to the frontend.
-        # We should find a better way to plumb status messages through.
-        await asyncio.sleep(1)
-        try:
-            await self.runtime.connect()
-        except AgentRuntimeUnavailableError as e:
-            self.logger.error(f'Runtime initialization failed: {e}')
-            if self._status_callback:
-                self._status_callback(
-                    'error', 'STATUS$ERROR_RUNTIME_DISCONNECTED', str(e)
-                )
-            return False
-
-        await self.runtime.clone_or_init_repo(
-            git_provider_tokens, selected_repository, selected_branch
+        # Composition 함수 호출로 객체 주입 (DI)
+        self.runtime = await compose_runtime(
+            runtimeParams,
+            sessionParams,
+            self.event_stream,  # 클래스 의존성 전달
+            self.sid,
+            self.user_id,
+            self._status_callback
         )
-        await call_sync_from_async(self.runtime.maybe_run_setup_script)
-        await call_sync_from_async(self.runtime.maybe_setup_git_hooks)
+        exit(0)
 
-        self.logger.debug(
-            f'Runtime initialized with plugins: {[plugin.name for plugin in self.runtime.plugins]}'
-        )
+        # custom_secrets_handler = UserSecrets(custom_secrets=sessionParams.custom_secrets or {})
+        # env_vars = custom_secrets_handler.get_env_vars()
+
+        # self.logger.debug(f'Initializing runtime `{runtimeParams.runtime_name}` now...')
+        # runtime_cls = get_runtime_cls(runtimeParams.runtime_name)
+        # if runtime_cls == RemoteRuntime:
+        #     # If provider tokens is passed in custom secrets, then remove provider from provider tokens
+        #     # We prioritize provider tokens set in custom secrets
+        #     overrided_tokens = self.override_provider_tokens_with_custom_secret(
+        #         sessionParams.git_provider_tokens, sessionParams.custom_secrets
+        #     )
+
+        #     self.runtime = runtime_cls(
+        #         config=config,
+        #         event_stream=self.event_stream,
+        #         sid=self.sid,
+        #         plugins=agent.sandbox_plugins,
+        #         status_callback=self._status_callback,
+        #         headless_mode=False,
+        #         attach_to_existing=False,
+        #         git_provider_tokens=overrided_tokens,
+        #         env_vars=env_vars,
+        #         user_id=self.user_id,
+        #     )
+        # else:
+        #     provider_handler = ProviderHandler(
+        #         provider_tokens=git_provider_tokens
+        #         or cast(PROVIDER_TOKEN_TYPE, MappingProxyType({}))
+        #     )
+
+        #     # Merge git provider tokens with custom secrets before passing over to runtime
+        #     env_vars.update(await provider_handler.get_env_vars(expose_secrets=True))
+        #     self.runtime = runtime_cls(
+        #         config=config,
+        #         event_stream=self.event_stream,
+        #         sid=self.sid,
+        #         plugins=agent.sandbox_plugins,
+        #         status_callback=self._status_callback,
+        #         headless_mode=False,
+        #         attach_to_existing=False,
+        #         env_vars=env_vars,
+        #         git_provider_tokens=git_provider_tokens,
+        #     )
+
+        # # FIXME: this sleep is a terrible hack.
+        # # This is to give the websocket a second to connect, so that
+        # # the status messages make it through to the frontend.
+        # # We should find a better way to plumb status messages through.
+        # await asyncio.sleep(1)
+        # try:
+        #     await self.runtime.connect()
+        # except AgentRuntimeUnavailableError as e:
+        #     self.logger.error(f'Runtime initialization failed: {e}')
+        #     if self._status_callback:
+        #         self._status_callback(
+        #             'error', 'STATUS$ERROR_RUNTIME_DISCONNECTED', str(e)
+        #         )
+        #     return False
+
+        # await self.runtime.clone_or_init_repo(
+        #     git_provider_tokens, selected_repository, selected_branch
+        # )
+        # await call_sync_from_async(self.runtime.maybe_run_setup_script)
+        # await call_sync_from_async(self.runtime.maybe_setup_git_hooks)
+
+        # self.logger.debug(
+        #     f'Runtime initialized with plugins: {[plugin.name for plugin in self.runtime.plugins]}'
+        # )
         return True
 
     def _create_controller(
