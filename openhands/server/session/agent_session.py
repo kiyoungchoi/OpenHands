@@ -180,6 +180,13 @@ async def compose_runtime(
     # settings를 로드한 후
     # if settings and settings.sandbox_runtime_container_image is None:
     #     settings.sandbox_runtime_container_image = config.sandbox.runtime_container_image
+
+    #temp: not good
+    #web:server_config from env in docker_compose
+    #cli: file settings (settings.json)
+    #me: just temp call from ramp.py
+    runtime_params.config.sandbox.runtime_container_image = "ghcr.io/all-hands-ai/runtime:0.45-nikolaik"
+
     runtime_cls = get_runtime_cls(runtime_params.runtime_name)
     if runtime_cls == RemoteRuntime:
         runtime = runtime_cls(
